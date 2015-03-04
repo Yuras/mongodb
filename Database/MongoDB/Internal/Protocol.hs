@@ -11,7 +11,7 @@
 module Database.MongoDB.Internal.Protocol (
     FullCollection,
     -- * Pipe
-    Pipe, newPipe, send, call,
+    Pipe, newPipe, newPipeWith, send, call,
     -- ** Notice
     Notice(..), InsertOption(..), UpdateOption(..), DeleteOption(..), CursorId,
     -- ** Request
@@ -50,6 +50,9 @@ import System.IO.Pipeline (Pipeline, newPipeline, IOStream(..))
 
 import qualified System.IO.Pipeline as P
 
+import Database.MongoDB.Internal.Connection (Connection)
+import qualified Database.MongoDB.Internal.Connection as Connection
+
 -- * Pipe
 
 type Pipe = Pipeline Response Message
@@ -58,6 +61,10 @@ type Pipe = Pipeline Response Message
 newPipe :: Handle -> IO Pipe
 -- ^ Create pipe over handle
 newPipe handle = newPipeline $ IOStream (writeMessage handle) (readMessage handle) (hClose handle)
+
+newPipeWith :: Connection -> IO Pipe
+-- ^ Create pipe over connection
+newPipeWith conn = newPipeline $ IOStream (writeMessageTo conn) (readMessageFrom conn) (Connection.close conn)
 
 send :: Pipe -> [Notice] -> IO ()
 -- ^ Send notices as a contiguous batch to server with no reply. Throw IOError if connection fails.
@@ -94,6 +101,21 @@ writeMessage handle (notices, mRequest) = do
         lenBytes = encodeSize . toEnum . fromEnum $ L.length bytes
     encodeSize = runPut . putInt32 . (+ 4)
 
+writeMessageTo :: Connection -> Message -> IO ()
+-- ^ Write message to connection
+writeMessageTo conn (notices, mRequest) = do
+    forM_ notices $ \n -> writeReq . (Left n,) =<< genRequestId
+    whenJust mRequest $ writeReq . (Right *** id)
+    Connection.flush conn
+ where
+    writeReq (e, requestId) = do
+        Connection.writeLazy conn lenBytes
+        Connection.writeLazy conn bytes
+     where
+        bytes = runPut $ (either putNotice putRequest e) requestId
+        lenBytes = encodeSize . toEnum . fromEnum $ L.length bytes
+    encodeSize = runPut . putInt32 . (+ 4)
+
 type Response = (ResponseTo, Reply)
 -- ^ Message received from a Mongo server in response to a Request
 
@@ -103,6 +125,14 @@ readMessage handle = readResp  where
     readResp = do
         len <- fromEnum . decodeSize <$> hGetN handle 4
         runGet getReply <$> hGetN handle len
+    decodeSize = subtract 4 . runGet getInt32
+
+readMessageFrom :: Connection -> IO Response
+-- ^ read response from a connection
+readMessageFrom conn = readResp  where
+    readResp = do
+        len <- fromEnum . decodeSize <$> Connection.readExactly conn 4
+        runGet getReply <$> Connection.readExactly conn len
     decodeSize = subtract 4 . runGet getInt32
 
 type FullCollection = Text
